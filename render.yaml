@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: gta6-auto-clips
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm ci --only=production
+    startCommand: node src/index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: BYNARA_API_KEY
+        sync: false
+      - key: BYNARA_BASE_URL
+        value: https://router.bynara.id/v1
+      - key: BYNARA_MODEL
+        value: agnes-2.5-flash
+      - key: INSTAGRAM_USERNAME
+        sync: false
+      - key: INSTAGRAM_PASSWORD
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: TWITCH_CLIENT_ID
+        sync: false
+      - key: TWITCH_ACCESS_TOKEN
+        sync: false

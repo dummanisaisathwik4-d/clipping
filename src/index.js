@@ -1,0 +1,163 @@
+const { spawn } = require('child_process');
+const path = require('path');
+const os = require('os');
+require('dotenv').config();
+const express = require('express');
+const cron = require('node-cron');
+const config = require('./config');
+const { findTrendingStreams } = require('./sources/youtube');
+const { findGta6Streams } = require('./sources/twitch');
+const { processSource } = require('./clipper');
+const { generateCaptions } = require('./captions');
+const { uploadToInstagram } = require('./instagram-uploader');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+app.use(express.json());
+
+/** @typedef {{id: string, status: 'queued'|'processing'|'completed'|'failed', createdAt: string, source: string, sourceUrl?: string, downloadedPath?: string, clips?: Array<{id:string,file:string,startTimer:number,endTime:number,score:number}>, caption?: string, hashtags?: string[], uploadResult?: object, error?: string, startedAt?: string, completedAt?: string, failedAt?: string}} Job */
+/** @type {Array<Job>} */
+const jobQueue = [];
+let isProcessing = false;
+
+/** POST /job – Create a clipping job */
+app.post('/job', (req, res) => {
+  /** @type {Job} */
+  const job = {
+    id: uuidv4(),
+    status: 'queued',
+    createdAt: new Date().toISOString(),
+    source: req.body.source || 'youtube',
+  };
+  jobQueue.push(job);
+  res.json({ success: true, jobId: job.id });
+});
+
+/** GET /jobs – List last 50 jobs */
+app.get('/jobs', (_req, res) => {
+  res.json(jobQueue.slice(-50));
+});
+
+/** GET /job/:id – Get job status */
+app.get('/job/:id', (req, res) => {
+  const job = jobQueue.find((j) => j.id === req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json(job);
+});
+
+/** GET /health – System health check */
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    queueLength: jobQueue.length,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/** POST /trigger – Manually trigger one clip cycle */
+app.post('/trigger', async (_req, res) => {
+  /** @type {Job} */
+  const job = {
+    id: uuidv4(),
+    status: 'queued',
+    createdAt: new Date().toISOString(),
+    source: _req.body.source || 'youtube',
+  };
+  jobQueue.push(job);
+
+  if (!isProcessing) {
+    void runOneJob(job);
+  }
+
+  res.json({ success: true, jobId: job.id });
+});
+
+/**
+ * Download a video from YouTube or Twitch using yt-dlp.
+ * @param {string} url  Video/stream URL.
+ * @returns {Promise<string>} Absolute path to downloaded MP4.
+ */
+async function downloadVideo(url) {
+  return new Promise((resolve, reject) => {
+    const outputFile = path.join(os.tmpdir(), `source_${Date.now()}.mp4`);
+    const proc = spawn('yt-dlp', [
+      '-f', 'bestvideo[height<=1080][fps<=30]+bestaudio/best[height<=1080]',
+      '--merge-output-format', 'mp4',
+      '-o', outputFile,
+      '--no-playlist',
+      '--retries', '3',
+      '--fragment-retries', '3',
+      url,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let stderr = '';
+    proc.stderr.on('data', (chunk) => { stderr += chunk; });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        console.log(`[Download] Saved: ${outputFile}`);
+        resolve(outputFile);
+      } else {
+        reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-200)}`));
+      }
+    });
+    proc.on('error', reject);
+  });
+}
+async function runOneJob(job) {
+  job.status = 'processing';
+  job.startedAt = new Date().toISOString();
+  console.log(`[Scheduler] Running job ${job.id}`);
+
+  try {
+    let sourceUrl;
+
+    if (job.source === 'youtube') {
+      const streams = await findTrendingStreams();
+      if (streams.length === 0) throw new Error('No live GTA 6 streams found on YouTube');
+      sourceUrl = streams[0].url;
+      job.sourceTitle = streams[0].title;
+    } else if (job.source === 'twitch') {
+      const streams = await findGta6Streams();
+      if (streams.length === 0) throw new Error('No active GTA 6 streams on Twitch');
+      sourceUrl = streams[0].url;
+      job.sourceTitle = streams[0].title;
+    } else {
+      throw new Error('Invalid source. Use "youtube" or "twitch".');
+    }
+
+    job.sourceUrl = sourceUrl;
+
+    // Download video from source
+    const downloadedPath = await downloadVideo(sourceUrl);
+    job.downloadedPath = downloadedPath;
+
+    // Process clips — analyze highlights and extract 1080p segments
+    job.clips = await processSource(downloadedPath, 1);
+    job.status = 'completed';
+    job.completedAt = new Date().toISOString();
+    console.log(`[Scheduler] Job ${job.id} done`);
+  } catch (error) {
+    job.status = 'failed';
+    job.error = error instanceof Error ? error.message : String(error);
+    job.failedAt = new Date().toISOString();
+    console.error(`[Scheduler] Job ${job.id} failed:`, job.error);
+  }
+}
+
+// Cron: execute one job every hour at minute 0
+cron.schedule('0 * * * *', () => {
+  if (isProcessing || jobQueue.length === 0) return;
+  isProcessing = true;
+  const job = jobQueue.shift();
+  void runOneJob(job).finally(() => { isProcessing = false; });
+});
+
+const PORT = config.port;
+app.listen(PORT, () => {
+  console.log(`[Scheduler] Server listening on port ${PORT}`);
+  console.log(`[Scheduler] Target: ${config.uploadSchedule.clipsPerDay} clips/day`);
+  console.log(`[Scheduler] Sources: YouTube + Twitch`);
+});
+
+module.exports = app;
