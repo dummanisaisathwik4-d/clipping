@@ -2,6 +2,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
 require('dotenv').config();
+
 const express = require('express');
 const cron = require('node-cron');
 const config = require('./config');
@@ -15,10 +16,13 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 app.use(express.json());
 
+// ─── In-memory job queue ───────────────────────────────────────────
 /** @typedef {{id: string, status: 'queued'|'processing'|'completed'|'failed', createdAt: string, source: string, sourceUrl?: string, downloadedPath?: string, clips?: Array<{id:string,file:string,startTimer:number,endTime:number,score:number}>, caption?: string, hashtags?: string[], uploadResult?: object, error?: string, startedAt?: string, completedAt?: string, failedAt?: string}} Job */
 /** @type {Array<Job>} */
 const jobQueue = [];
 let isProcessing = false;
+
+// ─── Routes ────────────────────────────────────────────────────────
 
 /** POST /job – Create a clipping job */
 app.post('/job', (req, res) => {
@@ -65,18 +69,17 @@ app.post('/trigger', async (_req, res) => {
     source: _req.body.source || 'youtube',
   };
   jobQueue.push(job);
-
-  if (!isProcessing) {
-    void runOneJob(job);
-  }
-
   res.json({ success: true, jobId: job.id });
+  if (!isProcessing && jobQueue.length > 0) void processNextJob();
 });
 
+// ─── Core functions ────────────────────────────────────────────────
+
 /**
- * Download a video from YouTube or Twitch using yt-dlp.
- * @param {string} url  Video/stream URL.
- * @returns {Promise<string>} Absolute path to downloaded MP4.
+ * Download a video from YouTube/Twitch using yt-dlp.
+ * Stderr is silenced so Render container output stays within limits.
+ * @param {string} url
+ * @returns {Promise<string>} Absolute path to the downloaded MP4.
  */
 async function downloadVideo(url) {
   return new Promise((resolve, reject) => {
@@ -88,76 +91,92 @@ async function downloadVideo(url) {
       '--no-playlist',
       '--retries', '3',
       '--fragment-retries', '3',
+      '--newline',          // strip progress bars from stderr
+      '-q',                 // quiet mode
       url,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    let stderr = '';
-    proc.stderr.on('data', (chunk) => { stderr += chunk; });
+    ], { stdio: ['ignore', 'ignore', 'ignore'] });   // all stdio discarded
     proc.on('close', (code) => {
-      if (code === 0) {
-        console.log(`[Download] Saved: ${outputFile}`);
-        resolve(outputFile);
-      } else {
-        reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-200)}`));
-      }
+      if (code === 0) resolve(outputFile);
+      else reject(new Error(`yt-dlp exited ${code}`));
     });
     proc.on('error', reject);
   });
 }
+
+/**
+ * Execute one full pipeline cycle for a single job.
+ */
 async function runOneJob(job) {
   job.status = 'processing';
   job.startedAt = new Date().toISOString();
-  console.log(`[Scheduler] Running job ${job.id}`);
 
-  try {
-    let sourceUrl;
-
-    if (job.source === 'youtube') {
-      const streams = await findTrendingStreams();
-      if (streams.length === 0) throw new Error('No live GTA 6 streams found on YouTube');
-      sourceUrl = streams[0].url;
-      job.sourceTitle = streams[0].title;
-    } else if (job.source === 'twitch') {
-      const streams = await findGta6Streams();
-      if (streams.length === 0) throw new Error('No active GTA 6 streams on Twitch');
-      sourceUrl = streams[0].url;
-      job.sourceTitle = streams[0].title;
-    } else {
-      throw new Error('Invalid source. Use "youtube" or "twitch".');
-    }
-
-    job.sourceUrl = sourceUrl;
-
-    // Download video from source
-    const downloadedPath = await downloadVideo(sourceUrl);
-    job.downloadedPath = downloadedPath;
-
-    // Process clips — analyze highlights and extract 1080p segments
-    job.clips = await processSource(downloadedPath, 1);
-    job.status = 'completed';
-    job.completedAt = new Date().toISOString();
-    console.log(`[Scheduler] Job ${job.id} done`);
-  } catch (error) {
-    job.status = 'failed';
-    job.error = error instanceof Error ? error.message : String(error);
-    job.failedAt = new Date().toISOString();
-    console.error(`[Scheduler] Job ${job.id} failed:`, job.error);
+  let sourceUrl;
+  if (job.source === 'youtube') {
+    const streams = await findTrendingStreams();
+    if (streams.length === 0) throw new Error('No live GTA 6 streams on YouTube');
+    sourceUrl = streams[0].url;
+    job.sourceTitle = streams[0].title;
+  } else if (job.source === 'twitch') {
+    const streams = await findGta6Streams();
+    if (streams.length === 0) throw new Error('No active GTA 6 streams on Twitch');
+    sourceUrl = streams[0].url;
+    job.sourceTitle = streams[0].title;
+  } else {
+    throw new Error('Invalid source');
   }
+  job.sourceUrl = sourceUrl;
+
+  // Download
+  const downloadedPath = await downloadVideo(sourceUrl);
+  job.downloadedPath = downloadedPath;
+
+  // Extract highlight clip (1080p)
+  job.clips = await processSource(downloadedPath, 1);
+
+  // Generate caption + hashtags via byNara
+  const clipSummary = `GTA 6 gameplay from ${sourceUrl}`;
+  const { caption, hashtags } = await generateCaptions(clipSummary);
+  job.caption = caption;
+  job.hashtags = hashtags;
+
+  // Upload to Instagram Reels
+  if (job.clips?.length > 0) {
+    const result = await uploadToInstagram(job.clips[0].file, caption, hashtags);
+    job.uploadResult = result;
+  }
+
+  job.status = 'completed';
+  job.completedAt = new Date().toISOString();
 }
 
-// Cron: execute one job every hour at minute 0
-cron.schedule('0 * * * *', () => {
+/**
+ * Dequeue and run the next job (sequentially, never concurrently).
+ */
+async function processNextJob() {
   if (isProcessing || jobQueue.length === 0) return;
   isProcessing = true;
   const job = jobQueue.shift();
-  void runOneJob(job).finally(() => { isProcessing = false; });
+  try {
+    await runOneJob(job);
+  } catch (err) {
+    job.status = 'failed';
+    job.error = err instanceof Error ? err.message : String(err);
+    job.failedAt = new Date().toISOString();
+  } finally {
+    isProcessing = false;
+  }
+}
+
+// ─── Scheduler ─────────────────────────────────────────────────────
+cron.schedule('0 * * * *', () => {
+  if (!isProcessing && jobQueue.length > 0) void processNextJob();
 });
 
+// ─── Start server ──────────────────────────────────────────────────
 const PORT = config.port;
 app.listen(PORT, () => {
-  console.log(`[Scheduler] Server listening on port ${PORT}`);
-  console.log(`[Scheduler] Target: ${config.uploadSchedule.clipsPerDay} clips/day`);
-  console.log(`[Scheduler] Sources: YouTube + Twitch`);
+  console.log(`[Scheduler] listening on port ${PORT}`);
+  console.log(`[Scheduler] target: ${config.uploadSchedule.clipsPerDay} clips/day`);
 });
 
 module.exports = app;
