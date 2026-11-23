@@ -16,33 +16,42 @@ async function initYouTube() {
 }
 
 /**
- * Find currently live GTA 6 streams on YouTube, sorted by viewers descending.
- * @returns {Promise<Array<{id: string, title: string, channel: string, viewCount: string, url: string, thumbnail?: string}>>}
+ * Find the most-viewed GTA 6 videos uploaded within the last 24 hours on YouTube,
+ * sorted by view count descending (most rated first).
+ * @returns {Promise<Array<{id: string, title: string, channel: string, viewCount: number, url: string, thumbnail?: string, publishedAt: string}>>}
  */
 async function findTrendingStreams(query = 'GTA 6') {
   const session = await initYouTube();
 
+  // Filter: uploadDate=last_24_hours → only videos published today
+  // SortBy: views → highest-viewed video appears first
   const search = await session.search(query, {
-    params: { filters: 'live', sortBy: 'relevance' },
+    params: {
+      filters: 'uploadDate=last_24_hours',
+      sortBy: 'views',
+    },
   });
 
-  const liveVideos = search.results.filter(
-    (item) => item.runTimeText?.text?.toLowerCase().includes('now'),
+  // Keep only video results (exclude playlists / livestreams / channels)
+  const videos = search.results.filter(
+    (item) => item.type === 'video' && item.runTimeText?.text,
   );
 
-  // Sort by viewer count descending so "most rated" is picked first
-  liveVideos.sort((a, b) => {
-    const parse = (v) => parseInt(v?.replace(/\D/g, '') || '0', 10);
-    return parse(b.viewers) - parse(a.viewers);
+  // Double-sort by raw view count descending as a safety net
+  videos.sort((a, b) => {
+    const parseViews = (v) =>
+      parseInt(v?.viewCountText?.text?.replace(/\D/g, '') || '0', 10);
+    return parseViews(b) - parseViews(a);
   });
 
-  return liveVideos.map((video) => ({
+  return videos.slice(0, 5).map((video) => ({
     id: video.videoId,
     title: video.title,
     channel: video.author,
-    viewCount: video.viewers ? `${video.viewers} watching` : 'Live',
+    viewCount: Number(video.viewCountText?.text?.replace(/\D/g, '') || '0'),
     url: `https://youtube.com/watch?v=${video.videoId}`,
     thumbnail: video.thumbnail?.[0]?.url,
+    publishedAt: video.uploadedDate?.text ?? '',
   }));
 }
 
