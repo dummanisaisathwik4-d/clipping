@@ -113,7 +113,7 @@ async function runOneJob(job) {
   let sourceUrl;
   if (job.source === 'youtube') {
     const streams = await findTrendingStreams();
-    if (streams.length === 0) throw new Error('No live GTA 6 streams on YouTube');
+    if (streams.length === 0) throw new Error('No recent GTA 6 videos found on YouTube');
     sourceUrl = streams[0].url;
     job.sourceTitle = streams[0].title;
   } else if (job.source === 'twitch') {
