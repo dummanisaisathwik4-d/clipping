@@ -62,6 +62,33 @@ app.post('/purge', (_req, res) => {
   res.json({ removed: jobs.length });
 });
 
+app.post('/process-queue', (_req, res) => {
+  const queued = jobs.filter((j) => j.status === 'queued');
+  if (!queued.length || isProcessing) {
+    return res.json({ message: 'No queued jobs or already processing', count: queued.length });
+  }
+  const job = queued[0];
+  job.status = 'processing';
+  job.startedAt = new Date().toISOString();
+  saveJobs(jobs);
+  console.log(`[manual] Processing job ${job.id}`);
+  spawnProcessJob(job.id).then(() => {
+    res.json({ message: 'Job started', jobId: job.id });
+  }).catch(err => {
+    res.status(500).json({ error: err.message });
+  });
+});
+
+async function spawnProcessJob(jobId) {
+  const { spawn } = require('child_process');
+  const child = spawn(process.execPath, [path.join(__dirname, 'worker.js')], {
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+  child.on('exit', (code) => {
+    console.log(`[manual] Worker exited code=${code} for job ${jobId}`);
+  });
+}
+
 // ─── Cron: dequeue one queued job per hour ─────────────────────────────────
 cron.schedule('0 * * * *', () => {
   const queued = jobs.filter((j) => j.status === 'queued');
