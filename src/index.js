@@ -26,6 +26,22 @@ function saveJobs(jobs) {
 }
 
 let jobs = loadJobs();
+
+// ─── Startup recovery: clear any stale processing jobs (>30 min old) ──
+const STALE_THRESHOLD_MS = 30 * 60 * 1000;
+jobs.forEach((job) => {
+  if (job.status === 'processing' && job.startedAt) {
+    const elapsed = Date.now() - new Date(job.startedAt).getTime();
+    if (elapsed > STALE_THRESHOLD_MS) {
+      console.warn(`[recovery] Clearing stale job ${job.id} (${Math.round(elapsed/60000)}min old)`);
+      job.status = 'failed';
+      job.error = 'Stale job cleared on restart (worker crashed or hung)';
+      job.failedAt = new Date().toISOString();
+    }
+  }
+});
+saveJobs(jobs);
+
 let isProcessing = false;
 
 // ─── Routes ────────────────────────────────────────────────────────────────
