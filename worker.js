@@ -17,6 +17,10 @@ const JOBS_FILE = path.join(DATA_DIR, 'jobs.json');
 const LOCK_FILE = path.join(DATA_DIR, '.lock');
 const WORKER_ID = parseInt(process.env.WORKER_ID || String(os.cpus().length - 1), 10);
 
+// Timeout constants (in milliseconds)
+const TIMEOUT_DOWNLOAD = 5 * 60 * 1000;   // 5 min for yt-dlp
+const TIMEOUT_PIPELINE = 10 * 60 * 1000;  // 10 min total pipeline
+
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 function readJobs() {
@@ -46,13 +50,33 @@ async function downloadVideo(url) {
   const { spawn } = require('child_process');
   return new Promise((resolve, reject) => {
     const outputFile = path.join(os.tmpdir(), `source_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+    console.log(`[download] Starting: ${url}`);
     const proc = spawn('yt-dlp', [
       '-f', 'bestvideo[height<=1080][fps<=30]+bestaudio/best[height<=1080]',
       '--merge-output-format', 'mp4', '-o', outputFile,
       '--no-playlist', '--retries', '3', '--fragment-retries', '3', '-q', url,
-    ], { stdio: ['ignore', 'ignore', 'ignore'] });
-    proc.on('close', (code) => code === 0 ? resolve(outputFile) : reject(new Error(`yt-dlp exited ${code}`)));
-    proc.on('error', reject);
+    ], { stdio: ['ignore', 'inherit', 'pipe'] });
+    proc.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      if (text.includes('[download]')) console.log('[download]', text.trim());
+    });
+    const timer = setTimeout(() => {
+      proc.kill('SIGTERM');
+      reject(new Error('Download timed out after 5 minutes'));
+    }, TIMEOUT_DOWNLOAD);
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        console.log(`[download] Saved: ${outputFile}`);
+        resolve(outputFile);
+      } else {
+        reject(new Error(`yt-dlp exited ${code}`));
+      }
+    });
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
@@ -63,6 +87,8 @@ async function runJob(job) {
   const { generateCaptions } = require('./captions');
   const { uploadToInstagram } = require('./instagram-uploader');
 
+  // Step 1: Find source
+  console.log(`[job] Finding source...`);
   let sourceUrl;
   if (job.source === 'twitch') {
     const streams = await findGta6Streams();
@@ -74,20 +100,33 @@ async function runJob(job) {
     sourceUrl = streams[0].url;
   }
   job.sourceUrl = sourceUrl;
+  console.log(`[job] Found: ${sourceUrl}`);
 
+  // Step 2: Download
   job.downloadedPath = await downloadVideo(sourceUrl);
+  console.log(`[job] Download complete`);
+
+  // Step 3: Extract clips
+  console.log(`[job] Processing highlights...`);
   job.clips = await processSource(job.downloadedPath, 1);
   if (!job.clips?.length) throw new Error('No clips extracted');
+  console.log(`[job] Extracted ${job.clips.length} clip(s)`);
 
+  // Step 4: Generate caption
+  console.log(`[job] Generating caption...`);
   const clipSummary = `GTA 6 gameplay from ${sourceUrl}`;
   const { caption, hashtags } = await generateCaptions(clipSummary);
   job.caption = caption;
   job.hashtags = hashtags;
+  console.log(`[job] Caption generated`);
 
+  // Step 5: Upload
+  console.log(`[job] Uploading to Instagram...`);
   const result = await uploadToInstagram(job.clips[0].file, caption, hashtags);
   job.uploadResult = result;
   job.status = 'completed';
   job.completedAt = new Date().toISOString();
+  console.log(`[job] Done!`);
 }
 
 // ─── Single-shot mode (called by cron / manual trigger) ──────────────────
@@ -106,10 +145,23 @@ async function runOneCycle() {
   releaseLock();
 
   console.log(`[worker#${WORKER_ID}] running job ${job.id} source=${job.source}`);
+
+  // Wrap entire pipeline in timeout
+  const pipelineTimeout = setTimeout(() => {
+    console.error(`[worker#${WORKER_ID}] Pipeline timed out after ${TIMEOUT_PIPELINE / 1000}s`);
+    job.status = 'failed';
+    job.error = `Pipeline exceeded ${TIMEOUT_PIPELINE / 1000}s timeout`;
+    job.failedAt = new Date().toISOString();
+    writeJobs(jobs);
+    process.exit(1);
+  }, TIMEOUT_PIPELINE);
+
   try {
     await runJob(job);
+    clearTimeout(pipelineTimeout);
     console.log(`[worker#${WORKER_ID}] job ${job.id} done`);
   } catch (err) {
+    clearTimeout(pipelineTimeout);
     job.status = 'failed';
     job.error = err instanceof Error ? err.message : String(err);
     job.failedAt = new Date().toISOString();
