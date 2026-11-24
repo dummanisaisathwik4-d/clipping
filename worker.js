@@ -20,6 +20,7 @@ const WORKER_ID = parseInt(process.env.WORKER_ID || String(os.cpus().length - 1)
 // Timeout constants (in milliseconds)
 const TIMEOUT_DOWNLOAD = 5 * 60 * 1000;   // 5 min for yt-dlp
 const TIMEOUT_PIPELINE = 10 * 60 * 1000;  // 10 min total pipeline
+const TIMEOUT_API = 30 * 1000;            // 30s per API call (YouTube/Twitch/LLM/IG)
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -87,20 +88,56 @@ async function runJob(job) {
   const { generateCaptions } = require('./captions');
   const { uploadToInstagram } = require('./instagram-uploader');
 
-  // Step 1: Find source
+  // Step 1: Find source — try YouTube first, then Twitch as fallback
   console.log(`[job] Finding source...`);
-  let sourceUrl;
-  if (job.source === 'twitch') {
-    const streams = await findGta6Streams();
-    if (!streams.length) throw new Error('No active GTA 6 Twitch streams');
-    sourceUrl = streams[0].url;
-  } else {
-    const streams = await findTrendingStreams();
-    if (!streams.length) throw new Error('No recent GTA 6 YouTube videos');
-    sourceUrl = streams[0].url;
+  let sourceUrl = null;
+  let lastError = null;
+
+  // Try YouTube with timeout
+  try {
+    console.log(`[job] Trying YouTube...`);
+    const streams = await Promise.race([
+      findTrendingStreams(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('YouTube API timeout (30s)'), TIMEOUT_API)),
+    ]);
+    if (streams.length > 0) {
+      sourceUrl = streams[0].url;
+      job.sourceTitle = streams[0].title;
+      console.log(`[job] Found via YouTube: ${sourceUrl}`);
+    } else {
+      lastError = 'No recent GTA 6 videos on YouTube';
+      console.warn(`[job] ${lastError}, trying Twitch...`);
+    }
+  } catch (err) {
+    lastError = `YouTube: ${err.message}`;
+    console.warn(`[job] ${lastError}, trying Twitch...`);
+  }
+
+  // Fallback to Twitch if YouTube failed
+  if (!sourceUrl) {
+    try {
+      console.log(`[job] Trying Twitch...`);
+      const streams = await Promise.race([
+        findGta6Streams(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Twitch API timeout (30s)')), TIMEOUT_API)),
+      ]);
+      if (streams.length > 0) {
+        sourceUrl = streams[0].url;
+        job.sourceTitle = streams[0].title;
+        console.log(`[job] Found via Twitch: ${sourceUrl}`);
+      } else {
+        lastError = lastError || 'No active GTA 6 streams on Twitch';
+      }
+    } catch (err) {
+      lastError = lastError ? `${lastError}; Twitch: ${err.message}` : `Twitch: ${err.message}`;
+      console.error(`[job] Twitch error: ${err.message}`);
+    }
+  }
+
+  if (!sourceUrl) {
+    throw new Error(lastError || 'All sources failed');
   }
   job.sourceUrl = sourceUrl;
-  console.log(`[job] Found: ${sourceUrl}`);
 
   // Step 2: Download
   job.downloadedPath = await downloadVideo(sourceUrl);
