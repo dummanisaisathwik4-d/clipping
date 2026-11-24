@@ -26,6 +26,7 @@ function saveJobs(jobs) {
 }
 
 let jobs = loadJobs();
+let isProcessing = false;
 
 // ─── Routes ────────────────────────────────────────────────────────────────
 
@@ -92,7 +93,8 @@ async function spawnProcessJob(jobId) {
 // ─── Cron: dequeue one queued job per hour ─────────────────────────────────
 cron.schedule('0 * * * *', () => {
   const queued = jobs.filter((j) => j.status === 'queued');
-  if (!queued.length) return;
+  if (!queued.length || isProcessing) return;
+  isProcessing = true;
   const job = queued[0];
   job.status = 'processing';
   job.startedAt = new Date().toISOString();
@@ -106,6 +108,7 @@ cron.schedule('0 * * * *', () => {
   child.on('exit', (code) => {
     // Worker itself updates the job record on completion/failure.
     console.log(`[cron] worker exited code=${code}`);
+    isProcessing = false;
   });
 });
 
