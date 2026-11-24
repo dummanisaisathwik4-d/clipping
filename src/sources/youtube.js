@@ -1,77 +1,66 @@
-const { Innertube } = require('youtubei.js');
-
-/** @type {import('youtubei.js').YouTubeSession | null} */
-let youtubeSession = null;
+const axios = require('axios');
+const config = require('../config');
 
 /**
- * Initialize or reuse YouTube session.
- * @returns {Promise<import('youtubei.js').YouTubeSession>}
- */
-async function initYouTube() {
-  if (youtubeSession) return youtubeSession;
-  console.log('[YouTube] Initializing session...');
-  youtubeSession = await Innertube.create();
-  console.log('[YouTube] Session initialized');
-  return youtubeSession;
-}
-
-/**
- * Find the most-viewed GTA 6 videos uploaded within the last 24 hours on YouTube,
- * sorted by view count descending (most rated first).
+ * Find the most-viewed GTA 6 videos uploaded within the last 24 hours
+ * using the official YouTube Data API v3.
  * @returns {Promise<Array<{id: string, title: string, channel: string, viewCount: number, url: string, thumbnail?: string, publishedAt: string}>>}
  */
 async function findTrendingStreams(query = 'GTA 6') {
-  const session = await initYouTube();
+  const apiKey = config.youtube?.apiKey;
+  if (!apiKey) throw new Error('YOUTUBE_API_KEY not configured in .env');
 
-  // Filter: uploadDate=last_24_hours → only videos published today
-  // SortBy: views → highest-viewed video appears first
-  const search = await session.search(query, {
-    params: {
-      filters: 'uploadDate=last_24_hours',
-      sortBy: 'views',
-    },
-  });
+  // Calculate 24h ago timestamp
+  const now = new Date();
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const isoStart = yesterday.toISOString();
 
-  // Keep only video results (exclude playlists / livestreams / channels)
-  const videos = search.results.filter(
-    (item) => item.type === 'video' && item.runTimeText?.text,
-  );
+  try {
+    const res = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+      params: {
+        part: 'snippet',
+        q: query,
+        type: 'video',
+        publishedAfter: isoStart,
+        order: 'viewCount',
+        maxResults: 10,
+        key: apiKey,
+      },
+    });
 
-  // Double-sort by raw view count descending as a safety net
-  videos.sort((a, b) => {
-    const parseViews = (v) =>
-      parseInt(v?.viewCountText?.text?.replace(/\D/g, '') || '0', 10);
-    return parseViews(b) - parseViews(a);
-  });
+    const items = res.data.items || [];
+    const videoIds = items.map((item) => item.id.videoId);
 
-  return videos.slice(0, 5).map((video) => ({
-    id: video.videoId,
-    title: video.title,
-    channel: video.author,
-    viewCount: Number(video.viewCountText?.text?.replace(/\D/g, '') || '0'),
-    url: `https://youtube.com/watch?v=${video.videoId}`,
-    thumbnail: video.thumbnail?.[0]?.url,
-    publishedAt: video.uploadedDate?.text ?? '',
-  }));
+    // Fetch view counts in parallel
+    let statsMap = new Map();
+    if (videoIds.length > 0) {
+      try {
+        const statsRes = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+          params: {
+            part: 'statistics',
+            id: videoIds.join(','),
+            key: apiKey,
+          },
+        });
+        statsRes.data.items.forEach((v) => {
+          statsMap.set(v.id, parseInt(v.statistics?.viewCount || '0', 10));
+        });
+      } catch (_) { /* stats optional */ }
+    }
+
+    return items.map((item) => ({
+      id: item.id.videoId,
+      title: item.snippet.title,
+      channel: item.snippet.channelTitle,
+      url: `https://youtube.com/watch?v=${item.id.videoId}`,
+      thumbnail: item.snippet.thumbnails.high?.url,
+      publishedAt: item.snippet.publishedAt,
+      viewCount: statsMap.get(item.id.videoId) || 0,
+    }));
+  } catch (err) {
+    console.error('[YouTube API] Error:', err.response?.data?.error?.message || err.message);
+    return [];
+  }
 }
 
-/**
- * Fetch metadata for a given YouTube video/stream URL.
- * @param {string} url
- * @returns {Promise<{id: string, title: string, duration: number, url: string, isLive: boolean}>}
- */
-async function getStreamVod(url) {
-  const session = await initYouTube();
-  const videoId = new URL(url).searchParams.get('v');
-  const result = await session.getBasicInfo(videoId);
-
-  return {
-    id: result.videoDetails.videoId,
-    title: result.videoDetails.title,
-    duration: Number(result.videoDetails.lengthSeconds),
-    url: result.videoDetails.thumbnail[0].url,
-    isLive: !!result.streamingData?.hlsManifestUrl,
-  };
-}
-
-module.exports = { findTrendingStreams, getStreamVod };
+module.exports = { findTrendingStreams };
