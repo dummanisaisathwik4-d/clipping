@@ -159,15 +159,17 @@ async function runOneCycle() {
   try {
     await runJob(job);
     clearTimeout(pipelineTimeout);
-    console.log(`[worker#${WORKER_ID}] job ${job.id} done`);
+    writeJobs(jobs); // Ensure final state is saved
+    console.log(`[worker#${WORKER_ID}] job ${job.id} completed successfully`);
+    process.exit(0);
   } catch (err) {
     clearTimeout(pipelineTimeout);
     job.status = 'failed';
     job.error = err instanceof Error ? err.message : String(err);
     job.failedAt = new Date().toISOString();
+    writeJobs(jobs); // Save failure state
     console.error(`[worker#${WORKER_ID}] job ${job.id} FAILED:`, job.error);
-  } finally {
-    writeJobs(jobs);
+    process.exit(1);
   }
 }
 
