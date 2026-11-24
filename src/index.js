@@ -79,6 +79,29 @@ app.post('/purge', (_req, res) => {
   res.json({ removed: jobs.length });
 });
 
+// Emergency endpoint to force-mark a processing job as failed
+app.post('/emergency/fail-job/:id', (_req, res) => {
+  const job = jobs.find((j) => j.id === req.params.id);
+  if (!job || job.status !== 'processing') {
+    return res.status(404).json({ error: 'Job not found or not in processing state' });
+  }
+  job.status = 'failed';
+  job.error = 'Emergency fail by admin';
+  job.failedAt = new Date().toISOString();
+  saveJobs(jobs);
+  console.log(`[emergency] Failed job ${job.id}`);
+  res.json({ success: true, jobId: job.id });
+});
+
+// Emergency endpoint to clear all stuck jobs
+app.post('/emergency/clear-stuck', (_req, res) => {
+  const stuckCount = jobs.filter((j) => j.status === 'processing').length;
+  jobs = jobs.filter((j) => j.status !== 'processing');
+  saveJobs(jobs);
+  console.log(`[emergency] Cleared ${stuckCount} stuck jobs`);
+  res.json({ cleared: stuckCount, remaining: jobs.length });
+});
+
 app.post('/process-queue', (_req, res) => {
   const queued = jobs.filter((j) => j.status === 'queued');
   if (!queued.length || isProcessing) {
